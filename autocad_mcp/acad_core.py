@@ -1421,10 +1421,78 @@ def zoom_extents(_: dict[str, Any]) -> dict[str, Any]:
         return result(True, "Zoomed to extents.")
 
 
+class _BITMAPINFOHEADER(ctypes.Structure):
+    _fields_ = [
+        ("biSize", wintypes.DWORD),
+        ("biWidth", wintypes.LONG),
+        ("biHeight", wintypes.LONG),
+        ("biPlanes", wintypes.WORD),
+        ("biBitCount", wintypes.WORD),
+        ("biCompression", wintypes.DWORD),
+        ("biSizeImage", wintypes.DWORD),
+        ("biXPelsPerMeter", wintypes.LONG),
+        ("biYPelsPerMeter", wintypes.LONG),
+        ("biClrUsed", wintypes.DWORD),
+        ("biClrImportant", wintypes.DWORD),
+    ]
+
+
+PW_RENDERFULLCONTENT = 2
+
+
+def _print_window(window: wintypes.HWND, width: int, height: int) -> Any:
+    """Render a window into a bitmap with PrintWindow; return a PIL image or None."""
+    from PIL import Image
+
+    user32 = ctypes.windll.user32
+    gdi32 = ctypes.windll.gdi32
+    user32.GetDC.argtypes = (wintypes.HWND,)
+    user32.GetDC.restype = wintypes.HDC
+    user32.ReleaseDC.argtypes = (wintypes.HWND, wintypes.HDC)
+    user32.PrintWindow.argtypes = (wintypes.HWND, wintypes.HDC, wintypes.UINT)
+    user32.PrintWindow.restype = wintypes.BOOL
+    gdi32.CreateCompatibleDC.argtypes = (wintypes.HDC,)
+    gdi32.CreateCompatibleDC.restype = wintypes.HDC
+    gdi32.CreateCompatibleBitmap.argtypes = (wintypes.HDC, ctypes.c_int, ctypes.c_int)
+    gdi32.CreateCompatibleBitmap.restype = wintypes.HBITMAP
+    gdi32.SelectObject.argtypes = (wintypes.HDC, wintypes.HGDIOBJ)
+    gdi32.SelectObject.restype = wintypes.HGDIOBJ
+    gdi32.GetDIBits.argtypes = (
+        wintypes.HDC, wintypes.HBITMAP, wintypes.UINT, wintypes.UINT,
+        ctypes.c_void_p, ctypes.c_void_p, wintypes.UINT,
+    )
+    gdi32.DeleteObject.argtypes = (wintypes.HGDIOBJ,)
+    gdi32.DeleteDC.argtypes = (wintypes.HDC,)
+
+    screen_dc = user32.GetDC(None)
+    mem_dc = gdi32.CreateCompatibleDC(screen_dc)
+    bitmap = gdi32.CreateCompatibleBitmap(screen_dc, width, height)
+    old = gdi32.SelectObject(mem_dc, bitmap)
+    try:
+        if not user32.PrintWindow(window, mem_dc, PW_RENDERFULLCONTENT):
+            return None
+        # Negative height asks for a top-down DIB, which is PIL's row order.
+        header = _BITMAPINFOHEADER(ctypes.sizeof(_BITMAPINFOHEADER), width, -height, 1, 32, 0, 0, 0, 0, 0, 0)
+        buffer = ctypes.create_string_buffer(width * height * 4)
+        if not gdi32.GetDIBits(mem_dc, bitmap, 0, height, buffer, ctypes.byref(header), 0):
+            return None
+    finally:
+        gdi32.SelectObject(mem_dc, old)
+        gdi32.DeleteObject(bitmap)
+        gdi32.DeleteDC(mem_dc)
+        user32.ReleaseDC(None, screen_dc)
+
+    image = Image.frombuffer("RGB", (width, height), buffer.raw, "raw", "BGRX", 0, 1)
+    # An all-black frame means the window declined to render.
+    if image.getbbox() is None:
+        return None
+    return image
+
+
 @tool(
     "capture_screenshot",
-    "Capture the running AutoCAD application window and return it as an MCP image. This reads the "
-    "desktop, so the window must be restored and unobscured; the reply says so when it was not.",
+    "Capture the running AutoCAD application window and return it as an MCP image. Uses PrintWindow, "
+    "so the window may be covered or on another virtual desktop, but it must not be minimised.",
     {
         "width_px": {
             "type": "integer",
@@ -1470,10 +1538,16 @@ def capture_screenshot(arguments: dict[str, Any]) -> dict[str, Any]:
     if rect.right <= rect.left or rect.bottom <= rect.top:
         raise RuntimeError("AutoCAD reported an empty window rectangle; the window may be off-screen.")
 
-    try:
-        image = ImageGrab.grab(bbox=(rect.left, rect.top, rect.right, rect.bottom))
-    except Exception as exc:
-        raise RuntimeError(f"Could not capture the AutoCAD window: {exc}") from exc
+    # PrintWindow asks the window to render itself, so it works when AutoCAD is
+    # covered or sits on another virtual desktop.  Fall back to a desktop grab
+    # only if that fails.
+    image = _print_window(window, rect.right - rect.left, rect.bottom - rect.top)
+    via_print_window = image is not None
+    if image is None:
+        try:
+            image = ImageGrab.grab(bbox=(rect.left, rect.top, rect.right, rect.bottom))
+        except Exception as exc:
+            raise RuntimeError(f"Could not capture the AutoCAD window: {exc}") from exc
 
     width = int(arguments.get("width_px", 1400))
     if image.width > width:
@@ -1489,12 +1563,13 @@ def capture_screenshot(arguments: dict[str, Any]) -> dict[str, Any]:
     payload = result(
         True,
         "Captured AutoCAD window."
-        if in_front
+        if in_front or via_print_window
         else "Captured AutoCAD window, but it was not the foreground window, so another window may cover it.",
         width=image.width,
         height=image.height,
         bytes=len(data),
         was_foreground=in_front,
+        method="PrintWindow" if via_print_window else "desktop",
     )
     payload["_image_png_base64"] = base64.b64encode(data).decode("ascii")
     return payload
